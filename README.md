@@ -6,7 +6,7 @@ Within-season Leslie depletion model linked across seasons via a random walk on 
 
 ```r
 # install.packages("devtools")
-devtools::install_github("your-username/LinkDeplete")
+devtools::install_github("sdelestang/LinkDeplete")
 ```
 
 ## Overview
