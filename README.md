@@ -54,7 +54,7 @@ Pin         <- BuildPars()
 random_pars <- RandomPars()
 
 # ── Fit the model ────────────────────────────────────────────────────────
-mod  <- MakeADFun(DepleteModel, Pin, random = random_pars, silent = FALSE)
+mod <- BuildModel(Pin, random_pars, silent = FALSE)
 mout <- nlminb(mod$par, mod$fn, mod$gr,
                control = list(iter.max = 2000, eval.max = 4000))
 

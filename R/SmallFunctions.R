@@ -275,3 +275,22 @@ save_example_input <- function(dest = getwd(), overwrite = FALSE) {
   message("Saved to: ", out)
   invisible(out)
 }
+
+#' Build TMB model from DepleteModel
+#'
+#' Wrapper that sets the correct environment for RTMB AD taping
+#' before calling \code{MakeADFun}.
+#'
+#' @param Pin Starting parameter list from \code{\link{BuildPars}}.
+#' @param random Character vector of random effect names from
+#'   \code{\link{RandomPars}}.
+#' @param silent Logical. Suppress output? Default \code{FALSE}.
+#'
+#' @return An RTMB model object as returned by \code{MakeADFun}.
+#'
+#' @export
+BuildModel <- function(Pin, random, silent = FALSE) {
+  fn <- DepleteModel
+  environment(fn) <- globalenv()
+  MakeADFun(fn, Pin, random = random, silent = silent)
+}
