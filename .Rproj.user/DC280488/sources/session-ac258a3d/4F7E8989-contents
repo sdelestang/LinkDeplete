@@ -1,0 +1,350 @@
+#### Model ####
+DepleteModel <- function(par) {
+  getAll(par, dat)
+
+  sigma_step <- exp(log_sigma_step)
+  nll <- 0
+
+  # ── Unpack parameters ─────────────────────────────────────────
+  q_fixed <- list()
+  sigma_q <- list()
+
+  ## Put q into vectors - annual or fixed
+  for (k in seq_len(N_cpue)) {
+    is_depl_k <- dat[[paste0("cpue_is_depl_", k)]]
+    if (is_depl_k == 0) {
+      q_fixed[[k]] <- exp(get(paste0("log_q_cpue", k)))
+    } else {
+      sigma_q[[k]] <- exp(get(paste0("log_sigma_q", k)))
+    }
+  }
+
+  #  Random walk prior on log_Recruitment #
+  for (s in 2:(S - 1)) {
+    nll <- nll - dnorm(log_R[s] - log_R[s - 1], 0, sigma_step, log = TRUE)
+  }
+
+  #  Random walk priors on q deviations #
+  for (k in seq_len(N_cpue)) {
+    is_depl_k <- dat[[paste0("cpue_is_depl_", k)]]
+    if (is_depl_k == 1) {
+      qdev <- get(paste0("log_q_cpue", k, "_dev"))
+      for (s in 2:S) {
+        nll <- nll - dnorm(qdev[s] - qdev[s - 1], 0, sigma_q[[k]], log = TRUE)
+      }
+    }
+  }
+
+  # objects for storage #
+  cpue_hat <- list()
+  for (k in seq_len(N_cpue)) cpue_hat[[k]] <- matrix(0, nrow=S, ncol=TS)
+
+  log_B_vec      <- numeric(S)    # Biomass vector
+  log_Brec_vec   <- numeric(S)    # Biomass after recruitment
+  log_Bmid_vec   <- numeric(S)    # Mid years biomass - fished
+  log_B0mid_vec  <- numeric(S)    # B0 is unfished version
+  log_Bend_vec   <- numeric(S)    # Biomass at end of season
+  log_B0end_vec  <- numeric(S)
+  log_Bavg_vec   <- numeric(S)    # Mean annual fished biomass
+  log_B0avg_vec  <- numeric(S)    # Mean annual unfished biomass
+  log_status_vec <- numeric(S)     # B/B0 version
+  log_status_avg_vec <- numeric(S) # B/B0 based on mean annual biomass
+  log_Bspm_vec <- numeric(S)       # replicate SPM estimates for comparison
+  log_F_vec      <- numeric(S)     # make annual F by compunding
+
+  B_now       <- exp(log_B1)      # Start biomass
+  B0_now      <- exp(log_B1)      # Second biomass which will not be fished
+  B_end_prev  <- exp(log_B1)      # End of prevuious timesteps (TS) biomass
+  B0_end_prev <- exp(log_B1)
+
+  # Start Season loop #
+  for (s in seq_len(S)) {
+
+    q_year <- list()   # Store qs
+    for (k in seq_len(N_cpue)) {
+      is_depl_k <- dat[[paste0("cpue_is_depl_", k)]]
+      if (is_depl_k == 1) {
+        q_year[[k]] <- exp(get(paste0("log_q_cpue", k, "_dev"))[s])
+      } else {
+        q_year[[k]] <- q_fixed[[k]]
+      }
+    }
+
+    if (s > 1) {
+      B_now  <- B_end_prev
+      B0_now <- B0_end_prev
+    }
+
+    log_Brec_vec[s] <- if (s == 1) log_B1 else log_R[s - 1] # No recruitment in years 1 TS 1
+
+    # Conduct Leslie depletion analysis using closed form linear model - faster
+    # Weighted least squares (WLS) solved in closed form so everything stays on the RTMB AD tape.
+    Sw   <- numeric(N_cpue)
+    SwK  <- numeric(N_cpue)
+    SwK2 <- numeric(N_cpue)
+    SwU  <- numeric(N_cpue)
+    SwUK <- numeric(N_cpue)
+    n_k  <- integer(N_cpue)
+
+    K_cum      <- 0
+    B_mean_acc <- 0     # Mean biomass
+    B0_mean_acc <- 0    # Unfished mean biomass accumulator
+    C_total    <- 0
+
+    if (s == 1) log_B_vec[1] <- log_B1
+
+    ## Timestep loop ##
+    for (m in seq_len(TS)) {
+
+      if (m == rec_ts && s > 1) {              # Add recruitment
+        B_now  <- B_now  + exp(log_R[s - 1])
+        B0_now <- B0_now + exp(log_R[s - 1])
+        log_B_vec[s] <- log(B_now)
+      }
+
+      C_m    <- catch[s, m]                     # Catch
+      B_mid  <- B_now  - C_m / 2                # Biomass in middle of timestep
+      B0_mid <- B0_now
+
+      for (k in seq_len(N_cpue)) {
+        cpue_hat[[k]][s, m] <- q_year[[k]] * B_mid   # Model Est cpue in middle TS.
+      }
+
+      # Adding v small offset whenver thnings are logged to stop blow up
+      if (m == ref_ts) {
+        log_Bmid_vec[s]  <- log(B_mid  + 1e-6)
+        log_B0mid_vec[s] <- log(B0_mid + 1e-6)
+      }
+
+      # Accumulate for annual mean biomass
+      B_mean_acc  <- B_mean_acc  + B_mid
+      B0_mean_acc <- B0_mean_acc + B0_mid
+      C_total     <- C_total + C_m
+
+      # Depletion accumulators if doing depletion
+      for (k in seq_len(N_cpue)) {
+        is_depl_k <- dat[[paste0("cpue_is_depl_", k)]]
+        if (is_depl_k == 0) next       # Move on
+
+        depl_steps <- dat[[paste0("cpue", k, "_depl")]]
+        if (!(m %in% depl_steps)) next       # Move on
+
+        ck   <- dat[[paste0("c", k)]]        # Grab cpues + cpue se
+        ckse <- dat[[paste0("c", k, "se")]]
+    # If cpue and se > Zero is not NA - add to accumulators to do analytic lm
+        if (!is.na(ck[s, m]) && ck[s, m] > 0 &&
+            !is.na(ckse[s, m]) && ckse[s, m] > 0) {
+          K_mid <- K_cum + C_m / 2
+          w <- 1 / ckse[s, m]^2
+          Sw[k]   <- Sw[k]   + w
+          SwK[k]  <- SwK[k]  + w * K_mid
+          SwK2[k] <- SwK2[k] + w * K_mid^2
+          SwU[k]  <- SwU[k]  + w * ck[s, m]
+          SwUK[k] <- SwUK[k] + w * ck[s, m] * K_mid
+          n_k[k]  <- n_k[k]  + 1
+        }
+      }
+
+      # Non-depletion series: direct biomass index likelihood
+      for (k in seq_len(N_cpue)) {
+        is_depl_k <- dat[[paste0("cpue_is_depl_", k)]]
+        if (is_depl_k == 1) next
+
+        ck   <- dat[[paste0("c", k)]]
+        ckse <- dat[[paste0("c", k, "se")]]
+
+        if (!is.na(ck[s, m]) && ck[s, m] > 0 &&
+            !is.na(ckse[s, m]) && ckse[s, m] > 0) {
+          cv  <- ckse[s, m] / ck[s, m]
+          ## NLL for fit between observed and estimated catch rate
+          nll <- nll - dnorm(log(ck[s, m]), log(q_fixed[[k]] * B_mid), cv, log = TRUE)
+        }
+      }
+
+      K_cum  <- K_cum + C_m
+      B_now  <- (B_now  - C_m) * exp(-M)
+      B0_now <-  B0_now        * exp(-M)
+
+    } # end timestep loop
+
+    B_end_prev  <- B_now
+    B0_end_prev <- B0_now
+
+    ## Make ehaps of different vectors of indices for plotting asnd reporting
+    ## Make biomass vector to compare with SPM
+    log_Bspm_vec[s] <- log(exp(log_B_vec[s]) - sum(catch[s, ]) / 2 + 1e-6)
+
+    # Mean annual biomass (fished and unfished)
+    log_Bavg_vec[s]  <- log(B_mean_acc  / TS + 1e-6)
+    log_B0avg_vec[s] <- log(B0_mean_acc / TS + 1e-6)
+
+    # Depletion based on mean annual biomass
+    log_status_avg_vec[s] <- log_Bavg_vec[s] - log_B0avg_vec[s]
+
+    # Annual F from mean biomass
+    B_mean  <- B_mean_acc / TS
+    exploit <- min(C_total / (B_mean + 1e-6), 0.99)
+
+    # Annual F from mid-year biomass
+    C_total    <- sum(catch[s, ])
+    B_post_rec <- exp(log_B_vec[s])
+    B_mid_yr   <- B_post_rec * exp(-M * (TS / 2 - rec_ts))
+    exploit    <- min(C_total / (B_mid_yr + 1e-6), 0.99)
+    log_F_vec[s] <- log(-log(1 - exploit) + 1e-6)
+    log_Bend_vec[s]   <- log(B_now + 1e-6)
+    log_B0end_vec[s]  <- log(B0_now + 1e-6)
+    log_status_vec[s] <- log_Bmid_vec[s] - log_B0mid_vec[s]
+
+    # Use accumulators to compute Leslie likelihood for each depletion series
+    for (k in seq_len(N_cpue)) {
+      is_depl_k <- dat[[paste0("cpue_is_depl_", k)]]
+      if (is_depl_k == 0 || n_k[k] < min_pts) next
+
+      denom_k <- Sw[k] * SwK2[k] - SwK[k]^2
+      b_k     <- -(Sw[k] * SwUK[k] - SwU[k] * SwK[k]) / denom_k
+      a_k     <- (SwU[k] - (-b_k) * SwK[k]) / Sw[k]
+      B0_k    <- a_k / b_k
+
+      if (b_k > 0 && B0_k > 0) {
+        sig_k <- sigma_q[[k]]
+        qdev  <- get(paste0("log_q_cpue", k, "_dev"))
+        nll   <- nll - dnorm(log(b_k), qdev[s], sig_k, log = TRUE)
+
+        var_b  <- Sw[k]   / denom_k
+        var_a  <- SwK2[k] / denom_k
+        cov_ab <- -SwK[k] / denom_k
+        var_B0 <- (1/b_k)^2 * var_a + (a_k/b_k^2)^2 * var_b -
+          2*(a_k/b_k^3)*cov_ab
+        if (var_B0 > 0) {
+          cv_B0 <- min(sqrt(var_B0) / B0_k, 5.0)
+          ## NLL for fit between Leslise  and Model initial biomass after recruitment
+          nll   <- nll - dnorm(log(B0_k), log_B_vec[s], cv_B0, log = TRUE)
+        }
+      }
+    }
+
+  } # end season loop
+
+  # ── REPORT / ADREPORT ──────────────────────────────────────────────────
+  REPORT(cpue_hat)
+  ADREPORT(log_Bspm_vec)
+  ADREPORT(log_B_vec)
+  ADREPORT(log_Brec_vec)
+  ADREPORT(log_Bmid_vec)
+  ADREPORT(log_B0mid_vec)
+  ADREPORT(log_Bend_vec)
+  ADREPORT(log_B0end_vec)
+  ADREPORT(log_Bavg_vec)
+  ADREPORT(log_B0avg_vec)
+  ADREPORT(log_status_vec)
+  ADREPORT(log_status_avg_vec)
+  ADREPORT(log_F_vec)
+
+  nll
+}
+
+
+
+
+####  Leslie regression diagnostic ####
+RunLeslie <- function(x) {leslie_diag <- do.call(rbind, lapply(seq_along(seasons), function(i) {
+  do.call(rbind, lapply(seq_len(N_cpue), function(k) {
+
+    if (!cpue_specs[[k]]$is_depl) {
+      return(data.frame(season = seasons[i], series = k, n = 0,
+                        b = NA, B0 = NA, cv_B0 = NA, flag = "NOT_DEPL"))
+    }
+
+    cpue_depl <- cpue_specs[[k]]$depl
+    cpue_mat  <- cpue_mats[[k]]
+    cpue_se   <- cpue_se_mats[[k]]
+
+    K_cum <- 0
+    Sw <- 0; SwK <- 0; SwK2 <- 0; SwU <- 0; SwUK <- 0; n <- 0
+
+    for (m in seq_len(TS)) {
+      C_m <- catch_mat[i, m]
+      if (m %in% cpue_depl) {
+        u  <- cpue_mat[i, m]
+        se <- cpue_se[i, m]
+        if (!is.na(u) && u > 0 && !is.na(se) && se > 0) {
+          w    <- 1 / se^2
+          Sw   <- Sw   + w
+          SwK  <- SwK  + w * K_cum
+          SwK2 <- SwK2 + w * K_cum^2
+          SwU  <- SwU  + w * u
+          SwUK <- SwUK + w * u * K_cum
+          n    <- n + 1L
+        }
+      }
+      K_cum <- K_cum + C_m
+    }
+
+    if (n >= dat$min_pts) {
+      denom <- Sw * SwK2 - SwK^2
+      b_raw <- (Sw * SwUK - SwU * SwK) / denom
+      b     <- -b_raw
+      a     <- (SwU - b_raw * SwK) / Sw
+      B0    <- a / b
+      var_b  <- Sw   / denom
+      var_a  <- SwK2 / denom
+      cov_ab <- -SwK / denom
+      var_B0 <- (1/b)^2 * var_a + (a/b^2)^2 * var_b - 2*(a/b^3)*cov_ab
+
+      flag <- dplyr::case_when(
+        b   <= 0    ~ "NEG_SLOPE",
+        B0  <= 0    ~ "NEG_B0",
+        var_B0 <= 0 ~ "NEG_VAR",
+        TRUE        ~ "ok"
+      )
+
+      data.frame(season = seasons[i], series = k, n = n,
+                 b = round(b, 6), B0 = round(B0, 1),
+                 cv_B0 = if (var_B0 > 0 && B0 > 0) round(sqrt(var_B0)/B0, 3) else NA,
+                 flag = flag)
+    } else {
+      data.frame(season = seasons[i], series = k, n = n,
+                 b = NA, B0 = NA, cv_B0 = NA, flag = "TOO_FEW_PTS")
+    }
+  }))
+}))}
+
+#### Function to make the matrices of catch and cpue ####
+make_mat <- function(col) {
+  mat <- matrix(NA, S, TS)
+  for (i in seq_along(seasons)) {
+    sub <- dat_monthly[dat_monthly$season == seasons[i], ]
+    mat[i, sub$season_step] <- sub[[col]]
+  }
+  mat
+}
+
+
+## ── Project one season forward, return F for a given total catch ─────────────
+project_depletion_end <- function(total_catch, B_end_prev, B0_end_prev, R, M,
+                                  catch_split, fish_steps, rec_ts, TS = 12) {
+
+  B_now  <- B_end_prev
+  B0_now <- B0_end_prev
+
+  for (m in seq_len(TS)) {
+    if (m == rec_ts) {
+      B_now  <- B_now  + R
+      B0_now <- B0_now + R
+    }
+
+    C_m <- if (m %in% fish_steps) total_catch * catch_split[which(fish_steps == m)] else 0
+
+    B_now  <- (B_now  - C_m) * exp(-M)
+    B0_now <-  B0_now         * exp(-M)
+  }
+
+  B_now / B0_now
+
+
+  result <- uniroot(
+    function(C) project_depletion_end(C, B_end_last, B0_end_last, R_recent, dat$M,
+                                      catch_split, fish_steps, dat$rec_ts, dat$TS) - dat$ref_levels[1],
+    interval = c(0, B_end_last + R_recent),
+    tol = 0.01
+  )}

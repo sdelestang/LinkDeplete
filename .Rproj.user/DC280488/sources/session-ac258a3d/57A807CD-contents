@@ -1,0 +1,174 @@
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+library(LobFunc)
+library(RTMB)
+library(tidyr)
+source('Dep_Model new V4.R')
+source('Plotting.R')
+getwd()
+# Catch Data
+dat <- read.csv('DepletionDataIn.csv')
+
+## Change df names so matches what model wants
+dat %<>% rename(cpue1=Unet, cpue1_se=Unetse, cpue2=Upot2, cpue2_se=Upot2se,cpue3=ULtwl2, cpue3_se=ULtwl2se) %>% mutate(cpue3_se=cpue3_se*1)
+
+## ── Set seasons ──────────────────────────────────────────────────────────────
+dat_monthly <- dat %>%
+  mutate(
+    season      = if_else(month >= 11, year, year - 1),
+    season_step = if_else(month >= 11, month - 10, month + 2),
+    catch       = catch / 1000
+  ) %>%
+  filter(season >= 1978)
+
+seasons <- sort(unique(dat_monthly$season))
+S  <- length(seasons)
+TS <- 12
+
+## Make Catch Matrix (for depletion) ##
+catch_mat <- make_mat("catch")
+catch_mat[is.na(catch_mat)] <- 0
+
+## Define CPUE series - depl refers to the timesteps for depletion analysis - is_depl identifys if depletion is to be fitted or just cpues, eg. annual trawl survey with one month ##
+cpue_specs <- list(
+  list(col = "cpue1", se_col = "cpue1_se", depl = 3:7,  is_depl = TRUE),
+  list(col = "cpue2", se_col = "cpue2_se", depl = 3:7,  is_depl = TRUE),
+  list(col = "cpue3", se_col = "cpue3_se", depl = 1:12, is_depl = FALSE),
+  list(col = "cpue4", se_col = "cpue4_se", depl = 3:7, is_depl = FALSE)
+)
+
+N_cpue <- sum(grepl("cpue", names(dat_monthly)))/2
+cpue_specs <- cpue_specs[1:N_cpue]
+
+cpue_mats    <- lapply(cpue_specs, function(s) make_mat(s$col))
+cpue_se_mats <- lapply(cpue_specs, function(s) make_mat(s$se_col))
+
+## ── Data input list ──────────────────────────────────────────────────────────
+dat <- list(
+  catch   = catch_mat,           # catch matrix
+  N_cpue  = N_cpue,              # number of cpue matrix
+  M       = 0.5 / TS,            # Natural mort / number of timesteps - assumes even temporal space in time between steps
+  min_pts = 3,                   # Dont do deplete if less than this many observations
+  S       = S,                   # Number of seasons
+  TS      = TS,                  # Number of Timesteps
+  rec_ts = 3,                    # Recruitment timestep
+  ref_ts = 6,                    # Timestep for reference comparison e.g. mid season 8 = June
+  ref_levels = c(0.4, 0.3, 0.2)  # Reference levels for Target, Threshold and Limit
+  )
+
+## Auto load the variuse number of cpues into dat ##
+for (k in seq_len(N_cpue)) {
+  dat[[paste0("c", k)]]             <- cpue_mats[[k]]
+  dat[[paste0("c", k, "se")]]       <- cpue_se_mats[[k]]
+  dat[[paste0("cpue", k, "_depl")]] <- cpue_specs[[k]]$depl
+  dat[[paste0("cpue_is_depl_", k)]] <- as.integer(cpue_specs[[k]]$is_depl)
+}
+
+##  Build starting log_R from Leslie B0 - helps to set parameters based ff individual estimates - use median for unknown years ##
+depl_series <- which(sapply(cpue_specs, `[[`, "is_depl"))
+
+## RunLeslie function
+leslie_diag <- RunLeslie()
+leslie_B0 <- rep(NA, S)
+for (i in seq_along(seasons)) {
+  for (k in depl_series) {
+    row <- leslie_diag[leslie_diag$season == seasons[i] & leslie_diag$series == k, ]
+    if (nrow(row) > 0 && row$flag == "ok") {
+      leslie_B0[i] <- row$B0
+      break
+    }
+  }
+}
+
+leslie_B0 <- zoo::na.approx(leslie_B0, na.rm = FALSE)
+leslie_B0[is.na(leslie_B0)] <- median(leslie_B0, na.rm = TRUE)
+
+## Parameters ##
+par <- list(
+  log_B1         = log(leslie_B0[1]),                      # Initial (model start) biomass
+  log_R          = log(pmax(leslie_B0[-1], 10)),           # Recruitment based off individual depletions
+  log_sigma_step = log(0.5)                                # Sigma for re applied to recruitment random walk
+)
+
+## Add starting parameter values for catchability deviations from mean based on mean of good depletion for each index (log_q_cpueX_dev) and a sigma for each catchability ("log_q_cpueX") ##
+for (k in seq_len(N_cpue)) {
+  if (cpue_specs[[k]]$is_depl) {
+    ok_rows <- leslie_diag[leslie_diag$series == k & leslie_diag$flag == "ok", ]
+    q_start <- if (nrow(ok_rows) > 0) mean(ok_rows$b) else 0.001
+    par[[paste0("log_q_cpue", k, "_dev")]] <- rep(log(q_start), S)
+    par[[paste0("log_sigma_q", k)]]        <- log(0.2)
+  } else {
+    par[[paste0("log_q_cpue", k)]] <- log(0.003)
+  }
+}
+
+## Both recruitment and catchability (if depletion) are random effects ##
+random_pars <- "log_R"
+for (k in seq_len(N_cpue)) {
+  if (cpue_specs[[k]]$is_depl) {
+    random_pars <- c(random_pars, paste0("log_q_cpue", k, "_dev"))
+  }
+}
+
+mod <- MakeADFun(DepleteModel, par, random = random_pars, silent = FALSE)
+
+mout <- nlminb(mod$par, mod$fn, mod$gr,control = list(iter.max = 2000, eval.max = 4000))
+
+# Check model  result ##
+mout
+# Was the gradient < 0.001 #
+max(abs(mod$gr()))
+
+## Plot fit to data
+Plot1()
+
+## Summary plots
+Plot4()
+
+## Assessment plot
+Plot5()
+
+# Get biomass out
+sdr     <- sdreport(mod)
+sdr_est <- as.data.frame(summary(sdr, "report"))
+Biom_out <- data.frame(year=seasons, EstBiom=exp(sdr_est$Estimate[grepl('log_Bspm_vec', rownames(sdr_est))]))
+write.csv(Biom_out, 'Deplet_Biom_out.csv', row.names = F)
+toXL(Biom_out)
+
+
+
+## Project to determine catch to fish to push biomas to 40% unfished
+# Recent 5-year average recruitment
+rows_R   <- rownames(sdr_est) == "log_Brec_vec"
+R_recent <- mean(tail(exp(sdr_est[rows_R, "Estimate"]), 5))
+
+# End-of-season biomass: fished and unfished (most recent year)
+B_end_last  <- exp(tail(sdr_est[rownames(sdr_est) == "log_Bend_vec", "Estimate"], 1))
+B0_end_last <- exp(tail(sdr_est[rownames(sdr_est) == "log_B0mid_vec", "Estimate"], 1))
+
+# Need B0 end-of-season — reconstruct from B0_mid by running remaining timesteps
+# Actually better: ADREPORT a log_B0end_vec from the model
+
+# For now, approximate B0_end from B0_mid:
+# B0_mid is at ref_ts, then M applies for remaining (TS - ref_ts) months
+B0_mid_last <- exp(tail(sdr_est[rownames(sdr_est) == "log_B0mid_vec", "Estimate"], 1))
+B0_end_last <- B0_mid_last * exp(-dat$M * (dat$TS - dat$ref_ts))
+
+# Catch split from recent data
+fish_steps  <- which(colMeans(tail(catch_mat, 5)) > 0)
+avg_monthly <- colMeans(tail(catch_mat, 5))[fish_steps]
+catch_split <- avg_monthly / sum(avg_monthly)
+
+# Solve for catch giving 40% depletion
+result <- uniroot(
+  function(C) project_depletion_end(C, B_end_last, B0_end_last, R_recent, dat$M,
+                                    catch_split, fish_steps, dat$rec_ts, dat$TS) - dat$ref_levels[1],
+  interval = c(0, B_end_last + R_recent),
+  tol = 0.01
+)
+
+cat("Recent 5-yr avg recruitment:", round(R_recent, 1), "t\n")
+cat("B_end (fished, latest):     ", round(B_end_last, 1), "t\n")
+cat("B0_end (unfished, latest):  ", round(B0_end_last, 1), "t\n")
+cat("Target depletion:            0.40\n")
+cat("Target catch:               ", round(result$root, 1), "t\n")
+cat("Target catch (kg):          ", round(result$root * 1000, 0), "kg\n")
