@@ -175,7 +175,8 @@ DepleteModel <- function(Pin) {
       }
 
       C_m    <- catch[s, m]                     # Catch
-      B_mid  <- B_now  - C_m / 2                # Biomass in middle of timestep
+      B_mid_raw <- B_now - C_m / 2
+      B_mid     <- (B_mid_raw + sqrt(B_mid_raw^2 + 1e-8)) / 2
       B0_mid <- B0_now
 
       for (k in seq_len(N_cpue)) {
@@ -234,7 +235,8 @@ DepleteModel <- function(Pin) {
       }
 
       K_cum  <- K_cum + C_m
-      B_now  <- (B_now  - C_m) * exp(-M)
+      B_rem  <- B_now - C_m
+      B_now  <- (B_rem + sqrt(B_rem^2 + 1e-8)) / 2 * exp(-M)
       B0_now <-  B0_now        * exp(-M)
 
     } # end timestep loop
