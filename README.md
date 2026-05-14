@@ -66,6 +66,11 @@ max(abs(mod$gr()))      # final gradient — want < 0.001
 Plot_fit(IsPrivate = FALSE)           # within-season CPUE fits
 Plot_summary(IsPrivate = TRUE)        # model summary (catch axis hidden)
 Plot_stock_status()                   # depletion, F, Kobe
+
+# ── Test model stability ─────────────────────────────────────────────────────────
+jit <- RunJitter(DepleteModel, n=10, v=0.1)
+retro <- RunRetro(model = DepleteModel, n_peel = 5)
+
 ```
 
 ## Privacy mode

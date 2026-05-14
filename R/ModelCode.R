@@ -1,4 +1,4 @@
-#' Depletion model negative log-likelihood
+#' Depletion model v1 negative log-likelihood
 #'
 #' RTMB objective function implementing a within-season Leslie depletion
 #' model linked across seasons by a random walk on log-recruitment.
@@ -71,7 +71,7 @@
 #'   for visualising model output.
 #'
 #' @export
-DepleteModel <- function(Pin) {
+DepleteModelv1 <- function(Pin) {
   getAll(Pin, Datain)
 
   sigma_step <- exp(log_sigma_step)
@@ -318,7 +318,7 @@ DepleteModel <- function(Pin) {
   nll
 }
 
-#' Depletion model v2 — direct CPUE likelihood
+#' Depletion model — direct CPUE likelihood
 #'
 #' Variant of \code{\link{DepleteModel}} that replaces the closed-form
 #' Leslie regression likelihood with direct lognormal fits of observed
@@ -341,7 +341,7 @@ DepleteModel <- function(Pin) {
 #' @seealso \code{\link{DepleteModel}}, \code{\link{Plot_fit}}
 #'
 #' @export
-DepleteModelv2 <- function(Pin) {
+DepleteModel <- function(Pin) {
   getAll(Pin, Datain)
 
   sigma_step <- exp(log_sigma_step)

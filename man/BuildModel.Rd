@@ -4,9 +4,11 @@
 \alias{BuildModel}
 \title{Build TMB model from DepleteModel}
 \usage{
-BuildModel(Pin, random, silent = FALSE)
+BuildModel(Model = DepleteModel, Pin, random, silent = FALSE)
 }
 \arguments{
+\item{Model}{Model version to use. Only currently 1 version so defaults to DepleteModel.}
+
 \item{Pin}{Starting parameter list from \code{\link{BuildPars}}.}
 
 \item{random}{Character vector of random effect names from
