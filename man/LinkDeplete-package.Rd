@@ -11,5 +11,10 @@ Fits a Leslie depletion model linked across seasons via a random walk on recruit
 \author{
 \strong{Maintainer}: Simon de Lestang \email{simon.delestang@dpird.wa.gov.au}
 
+Authors:
+\itemize{
+  \item Simon de Lestang \email{simon.delestang@dpird.wa.gov.au}
+}
+
 }
 \keyword{internal}

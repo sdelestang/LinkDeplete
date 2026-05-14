@@ -289,8 +289,8 @@ save_example_input <- function(dest = getwd(), overwrite = FALSE) {
 #' @return An RTMB model object as returned by \code{MakeADFun}.
 #'
 #' @export
-BuildModel <- function(Pin, random, silent = FALSE) {
-  fn <- DepleteModel
+BuildModel <- function(Model, Pin, random, silent = FALSE) {
+  fn <- Model
   environment(fn) <- globalenv()
   MakeADFun(fn, Pin, random = random, silent = silent)
 }

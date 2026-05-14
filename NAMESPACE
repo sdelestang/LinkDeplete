@@ -3,6 +3,7 @@
 export(BuildModel)
 export(BuildPars)
 export(DepleteModel)
+export(DepleteModelv2)
 export(MakeDataIn)
 export(Plot_fit)
 export(Plot_stock_status)

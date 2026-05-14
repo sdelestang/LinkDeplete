@@ -318,6 +318,213 @@ DepleteModel <- function(Pin) {
   nll
 }
 
+#' Depletion model v2 — direct CPUE likelihood
+#'
+#' Variant of \code{\link{DepleteModel}} that replaces the closed-form
+#' Leslie regression likelihood with direct lognormal fits of observed
+#' CPUE against \code{q * B_mid} for all series (depletion and
+#' non-depletion alike). This avoids collapsing within-season
+#' observations into summary statistics and lets each monthly data
+#' point independently inform biomass and catchability.
+#'
+#' @inheritParams DepleteModel
+#'
+#' @return Scalar negative log-likelihood with the same REPORT/ADREPORT
+#'   side effects as \code{\link{DepleteModel}}.
+#'
+#' @details
+#' The data and parameter lists are identical to \code{\link{DepleteModel}}.
+#' The only structural change is in how depletion-series CPUE enters the
+#' likelihood: individual observations within the depletion window are
+#' fitted directly rather than via Leslie slope and intercept summaries.
+#'
+#' @seealso \code{\link{DepleteModel}}, \code{\link{Plot_fit}}
+#'
+#' @export
+DepleteModelv2 <- function(Pin) {
+  getAll(Pin, Datain)
+
+  sigma_step <- exp(log_sigma_step)
+  nll <- 0
+
+  # ── Prior on sigma_step ────────────────────────────────────────
+  nll <- nll - dlnorm(sigma_step, log(0.3), 0.5, log = TRUE)
+
+  # ── Unpack parameters ─────────────────────────────────────────
+  q_fixed <- list()
+  sigma_q <- list()
+
+  for (k in seq_len(N_cpue)) {
+    is_depl_k <- Datain[[paste0("cpue_is_depl_", k)]]
+    if (is_depl_k == 0) {
+      q_fixed[[k]] <- exp(get(paste0("log_q_cpue", k)))
+    } else {
+      sigma_q[[k]] <- exp(get(paste0("log_sigma_q", k)))
+    }
+  }
+
+  # ── Random walk prior on log_Recruitment ───────────────────────
+  for (s in 2:(S - 1)) {
+    nll <- nll - dnorm(log_R[s] - log_R[s - 1], 0, sigma_step, log = TRUE)
+  }
+
+  # ── Random walk priors on q deviations ─────────────────────────
+  for (k in seq_len(N_cpue)) {
+    is_depl_k <- Datain[[paste0("cpue_is_depl_", k)]]
+    if (is_depl_k == 1) {
+      qdev <- get(paste0("log_q_cpue", k, "_dev"))
+      for (s in 2:S) {
+        nll <- nll - dnorm(qdev[s] - qdev[s - 1], 0, sigma_q[[k]], log = TRUE)
+      }
+    }
+  }
+
+  # ── Storage objects ────────────────────────────────────────────
+  cpue_hat <- list()
+  for (k in seq_len(N_cpue)) cpue_hat[[k]] <- matrix(0, nrow = S, ncol = TS)
+
+  log_B_vec          <- numeric(S)
+  log_Brec_vec       <- numeric(S)
+  log_Bmid_vec       <- numeric(S)
+  log_B0mid_vec      <- numeric(S)
+  log_Bend_vec       <- numeric(S)
+  log_B0end_vec      <- numeric(S)
+  log_Bavg_vec       <- numeric(S)
+  log_B0avg_vec      <- numeric(S)
+  log_status_vec     <- numeric(S)
+  log_status_avg_vec <- numeric(S)
+  log_Bspm_vec       <- numeric(S)
+  log_F_vec          <- numeric(S)
+
+  B_now       <- exp(log_B1)
+  B0_now      <- exp(log_B1)
+  B_end_prev  <- exp(log_B1)
+  B0_end_prev <- exp(log_B1)
+
+  # ── Season loop ────────────────────────────────────────────────
+  for (s in seq_len(S)) {
+
+    q_year <- list()
+    for (k in seq_len(N_cpue)) {
+      is_depl_k <- Datain[[paste0("cpue_is_depl_", k)]]
+      if (is_depl_k == 1) {
+        q_year[[k]] <- exp(get(paste0("log_q_cpue", k, "_dev"))[s])
+      } else {
+        q_year[[k]] <- q_fixed[[k]]
+      }
+    }
+
+    if (s > 1) {
+      B_now  <- B_end_prev
+      B0_now <- B0_end_prev
+    }
+
+    log_Brec_vec[s] <- if (s == 1) log_B1 else log_R[s - 1]
+
+    K_cum       <- 0
+    B_mean_acc  <- 0
+    B0_mean_acc <- 0
+    C_total     <- 0
+
+    if (s == 1) log_B_vec[1] <- log_B1
+
+    # ── Timestep loop ──────────────────────────────────────────
+    for (m in seq_len(TS)) {
+
+      if (m == rec_ts && s > 1) {
+        B_now  <- B_now  + exp(log_R[s - 1])
+        B0_now <- B0_now + exp(log_R[s - 1])
+        log_B_vec[s] <- log(B_now)
+      }
+
+      C_m       <- catch[s, m]
+      B_mid_raw <- B_now - C_m / 2
+      B_mid     <- (B_mid_raw + sqrt(B_mid_raw^2 + 1e-8)) / 2   # AD-safe soft floor
+      B0_mid    <- B0_now
+
+      for (k in seq_len(N_cpue)) {
+        cpue_hat[[k]][s, m] <- q_year[[k]] * B_mid
+      }
+
+      if (m == ref_ts) {
+        log_Bmid_vec[s]  <- log(B_mid  + 1e-6)
+        log_B0mid_vec[s] <- log(B0_mid + 1e-6)
+      }
+
+      B_mean_acc  <- B_mean_acc  + B_mid
+      B0_mean_acc <- B0_mean_acc + B0_mid
+      C_total     <- C_total + C_m
+
+      # ── Direct CPUE likelihood for ALL series ──────────────
+      for (k in seq_len(N_cpue)) {
+        is_depl_k <- Datain[[paste0("cpue_is_depl_", k)]]
+
+        # For depletion series, only fit within the depletion window
+        if (is_depl_k == 1) {
+          depl_steps <- Datain[[paste0("cpue", k, "_depl")]]
+          if (!(m %in% depl_steps)) next
+        }
+
+        ck   <- Datain[[paste0("c", k)]]
+        ckse <- Datain[[paste0("c", k, "se")]]
+
+        if (!is.na(ck[s, m]) && ck[s, m] > 0 &&
+            !is.na(ckse[s, m]) && ckse[s, m] > 0) {
+          cv  <- ckse[s, m] / ck[s, m]
+          nll <- nll - dnorm(log(ck[s, m]), log(q_year[[k]] * B_mid + 1e-8),
+                             cv, log = TRUE)
+        }
+      }
+
+      K_cum  <- K_cum + C_m
+      B_rem  <- B_now - C_m
+      B_now  <- (B_rem + sqrt(B_rem^2 + 1e-8)) / 2 * exp(-M)
+      B0_now <-  B0_now * exp(-M)
+
+    } # end timestep loop
+
+    B_end_prev  <- B_now
+    B0_end_prev <- B0_now
+
+    # ── Reporting vectors ──────────────────────────────────────
+    log_Bspm_vec[s] <- log(exp(log_B_vec[s]) - sum(catch[s, ]) / 2 + 1e-6)
+
+    log_Bavg_vec[s]  <- log(B_mean_acc  / TS + 1e-6)
+    log_B0avg_vec[s] <- log(B0_mean_acc / TS + 1e-6)
+
+    log_status_avg_vec[s] <- log_Bavg_vec[s] - log_B0avg_vec[s]
+
+    # Annual F from mid-year biomass
+    B_mean     <- B_mean_acc / TS
+    C_total    <- sum(catch[s, ])
+    B_post_rec <- exp(log_B_vec[s])
+    B_mid_yr   <- B_post_rec * exp(-M * (TS / 2 - rec_ts))
+    exploit    <- min(C_total / (B_mid_yr + 1e-6), 0.99)
+    log_F_vec[s] <- log(-log(1 - exploit) + 1e-6)
+
+    log_Bend_vec[s]   <- log(B_now + 1e-6)
+    log_B0end_vec[s]  <- log(B0_now + 1e-6)
+    log_status_vec[s] <- log_Bmid_vec[s] - log_B0mid_vec[s]
+
+  } # end season loop
+
+  # ── REPORT / ADREPORT ──────────────────────────────────────────
+  REPORT(cpue_hat)
+  ADREPORT(log_Bspm_vec)
+  ADREPORT(log_B_vec)
+  ADREPORT(log_Brec_vec)
+  ADREPORT(log_Bmid_vec)
+  ADREPORT(log_B0mid_vec)
+  ADREPORT(log_Bend_vec)
+  ADREPORT(log_B0end_vec)
+  ADREPORT(log_Bavg_vec)
+  ADREPORT(log_B0avg_vec)
+  ADREPORT(log_status_vec)
+  ADREPORT(log_status_avg_vec)
+  ADREPORT(log_F_vec)
+
+  nll
+}
 
 #' Leslie regression diagnostic
 #'
