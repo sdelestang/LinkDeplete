@@ -63,7 +63,7 @@
 #'   \item{\code{cpueK_depl}}{Integer vector of time steps used in the
 #'     depletion regression for series \emph{K}.}
 #'   \item{\code{cK}, \code{cKse}}{CPUE and standard error matrices
-#'     (\code{S x TS}) for series \emph{K}.}
+#'       (\code{S x TS}) for series \emph{K}.}
 #' }
 #'
 #' @seealso \code{\link{RunLeslie}} for standalone Leslie regression
@@ -76,6 +76,7 @@ DepleteModel <- function(Pin) {
 
   sigma_step <- exp(log_sigma_step)
   nll <- 0
+  nll <- nll - dlnorm(sigma_step, log(0.3), 0.5, log = TRUE)
 
   # ── Unpack parameters ─────────────────────────────────────────
   q_fixed <- list()
@@ -176,7 +177,7 @@ DepleteModel <- function(Pin) {
 
       C_m    <- catch[s, m]                     # Catch
       B_mid_raw <- B_now - C_m / 2
-      B_mid     <- (B_mid_raw + sqrt(B_mid_raw^2 + 1e-8)) / 2
+      B_mid  <- (B_mid_raw + sqrt(B_mid_raw^2 + 1e-8)) / 2   # AD-safe soft floor
       B0_mid <- B0_now
 
       for (k in seq_len(N_cpue)) {
@@ -255,13 +256,15 @@ DepleteModel <- function(Pin) {
     # Depletion based on mean annual biomass
     log_status_avg_vec[s] <- log_Bavg_vec[s] - log_B0avg_vec[s]
 
+    # Annual F from mean biomass
+    B_mean  <- B_mean_acc / TS
+    exploit <- min(C_total / (B_mean + 1e-6), 0.99)
+
     # Annual F from mid-year biomass
-    B_mean     <- B_mean_acc / TS
     C_total    <- sum(catch[s, ])
     B_post_rec <- exp(log_B_vec[s])
     B_mid_yr   <- B_post_rec * exp(-M * (TS / 2 - rec_ts))
-    exploit_raw <- C_total / (B_mid_yr + 1e-6)
-    exploit     <- (exploit_raw + 0.99 - sqrt((exploit_raw - 0.99)^2 + 1e-6)) / 2
+    exploit    <- min(C_total / (B_mid_yr + 1e-6), 0.99)
     log_F_vec[s] <- log(-log(1 - exploit) + 1e-6)
     log_Bend_vec[s]   <- log(B_now + 1e-6)
     log_B0end_vec[s]  <- log(B0_now + 1e-6)
@@ -288,8 +291,7 @@ DepleteModel <- function(Pin) {
         var_B0 <- (1/b_k)^2 * var_a + (a_k/b_k^2)^2 * var_b -
           2*(a_k/b_k^3)*cov_ab
         if (var_B0 > 0) {
-          cv_raw <- sqrt(var_B0) / B0_k
-          cv_B0  <- (cv_raw + 5.0 - sqrt((cv_raw - 5.0)^2 + 1e-6)) / 2
+          cv_B0 <- min(sqrt(var_B0) / B0_k, 5.0)
           ## NLL for fit between Leslise  and Model initial biomass after recruitment
           nll   <- nll - dnorm(log(B0_k), log_B_vec[s], cv_B0, log = TRUE)
         }
@@ -315,7 +317,6 @@ DepleteModel <- function(Pin) {
 
   nll
 }
-
 
 
 #' Leslie regression diagnostic
